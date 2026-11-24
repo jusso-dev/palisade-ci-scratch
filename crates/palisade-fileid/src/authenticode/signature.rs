@@ -718,6 +718,10 @@ pub enum InvalidReason {
     CertificateTable(CertificateTableError),
     /// No signature is valid. This is the status of the first one.
     Signature(SignatureStatus),
+    /// A script carries a signature block (#52) that could not be read:
+    /// the block is malformed, or the text cannot be decoded without
+    /// ambiguity. Why is [`crate::script::ScriptReport::signing_state`].
+    ScriptSignatureBlock,
 }
 
 /// The signing state of a file.
