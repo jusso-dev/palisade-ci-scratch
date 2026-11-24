@@ -149,8 +149,8 @@ pub use signature::{
     BadSignature, CertificateEntry, CertificateTableError, Curve, DigestAlgorithm, InvalidReason,
     KeyAlgorithm, OsCiIssue, PageHashes, ReportWarning, SignatureAlgorithm, SignatureCheck,
     SignatureError, SignatureInfo, SignatureKind, SignatureReport, SignatureStatus,
-    SignatureWarning, SignerAttributes, SignerIdentifier, SigningState, StatementType,
-    TimestampKind, TimestampToken, Unsupported, VerifyOptions,
+    SignatureWarning, SignedMetadata, SignerAttributes, SignerIdentifier, SigningState,
+    StatementType, TimestampKind, TimestampToken, Unsupported, VerifyOptions,
 };
 pub use timestamp::{
     MAX_FILE_TIMESTAMPS, MAX_TIMESTAMP_WARNINGS, MAX_TOKEN_CERTIFICATES, TimestampError,
