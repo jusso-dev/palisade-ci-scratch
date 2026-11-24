@@ -96,6 +96,10 @@ const FILETYPE_SEEDS: Seed = Seed {
     test: "filetype",
     name: "write_fuzz_seeds",
 };
+const SCRIPT_SEEDS: Seed = Seed {
+    test: "script",
+    name: "write_script_fuzz_seeds",
+};
 const TRUST_SET_SEEDS: Seed = Seed {
     test: "trust_set",
     name: "write_trust_set_fuzz_seeds",
@@ -151,6 +155,11 @@ pub const PROJECTS: &[Project] = &[
                 name: "fuzz_classify",
                 dict: None,
                 seeds: &[FILETYPE_SEEDS],
+            },
+            Target {
+                name: "script_sig",
+                dict: Some("script.dict"),
+                seeds: &[SCRIPT_SEEDS],
             },
         ],
     },
