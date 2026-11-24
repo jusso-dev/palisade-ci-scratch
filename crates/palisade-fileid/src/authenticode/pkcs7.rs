@@ -9,7 +9,8 @@
 use super::asn1::{self, ObjectId, Reader, Tlv, oid, read_oid, read_small_uint, tag};
 use super::signature::{
     Curve, DigestAlgorithm, KeyAlgorithm, PageHashes, SignatureAlgorithm, SignatureError,
-    SignatureWarning, SignerIdentifier, StatementType, TimestampKind, TimestampToken,
+    SignatureWarning, SignedMetadata, SignerIdentifier, StatementType, TimestampKind,
+    TimestampToken,
 };
 use crate::hash::HashAlgorithm;
 
@@ -88,6 +89,7 @@ pub(crate) struct Signer<'a> {
     pub opus: Opus,
     pub statement_type: Option<StatementType>,
     pub signing_time: Option<i64>,
+    pub signed_metadata: SignedMetadata,
     pub sig_alg: SignatureAlgorithm,
     /// The signature value (`encryptedDigest`): what a timestamp covers.
     pub signature: &'a [u8],
@@ -127,6 +129,43 @@ pub(crate) fn parse_content_info(der: &[u8], base: usize) -> Result<(SignedData<
             signer: envelope.signer,
             warnings: envelope.warnings,
         },
+        trailing,
+    ))
+}
+
+/// `SpcSipInfo`: which subject interface package hashed a non-PE file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SipInfo {
+    /// `dwSIPversion`.
+    pub version: u32,
+    /// `gSIPguid`, as encoded.
+    pub guid: [u8; 16],
+}
+
+/// Decodes a `ContentInfo` holding an Authenticode SignedData whose
+/// indirect data is `SPC_SIPINFO` (a script, #52), the same way as
+/// [`parse_content_info`]. The [`IndirectData`] has no PE image flags or
+/// page hashes.
+pub(crate) fn parse_sip_content_info(
+    der: &[u8],
+    base: usize,
+) -> Result<(SignedData<'_>, SipInfo, &[u8])> {
+    let (envelope, (indirect, sip), trailing) = parse_envelope(
+        der,
+        base,
+        oid::SPC_INDIRECT_DATA,
+        SignatureError::NotIndirectData,
+        |seq, _| parse_sip_indirect_data(seq),
+    )?;
+    Ok((
+        SignedData {
+            signer_digest_listed: envelope.signer_digest_listed,
+            indirect,
+            certificates: envelope.certificates,
+            signer: envelope.signer,
+            warnings: envelope.warnings,
+        },
+        sip,
         trailing,
     ))
 }
@@ -333,7 +372,19 @@ fn parse_indirect_data<'a>(seq: &Tlv<'a>, warnings: &mut Warnings) -> Result<Ind
     }
     d.finish()?;
 
-    // DigestInfo.
+    let (digest_alg, digest) = parse_digest_info(&mut r)?;
+    Ok(IndirectData {
+        content: seq.content,
+        digest_alg,
+        digest,
+        pe_image_flags,
+        page_hashes,
+    })
+}
+
+/// The `DigestInfo` that ends an `SpcIndirectDataContent`, and nothing
+/// after it. A digest of a known algorithm must be its length.
+fn parse_digest_info<'a>(r: &mut Reader<'a>) -> Result<(DigestId, &'a [u8])> {
     let digest_info = r.read(tag::SEQUENCE)?;
     let mut di = digest_info.reader();
     let digest_alg = parse_digest_alg(&di.read(tag::SEQUENCE)?)?;
@@ -345,13 +396,43 @@ fn parse_indirect_data<'a>(seq: &Tlv<'a>, warnings: &mut Warnings) -> Result<Ind
             return Err(SignatureError::DigestLength);
         }
     }
-    Ok(IndirectData {
-        content: seq.content,
-        digest_alg,
-        digest,
-        pe_image_flags,
-        page_hashes,
-    })
+    Ok((digest_alg, digest))
+}
+
+/// `SpcIndirectDataContent` with `SPC_SIPINFO` data:
+/// `SEQUENCE { SEQUENCE { OID, SpcSipInfo }, DigestInfo }`, where
+/// `SpcSipInfo ::= SEQUENCE { dwSIPversion INTEGER, gSIPguid OCTET STRING,
+/// dwReserved1..5 INTEGER }`.
+fn parse_sip_indirect_data<'a>(seq: &Tlv<'a>) -> Result<(IndirectData<'a>, SipInfo)> {
+    let mut r = seq.reader();
+    let data = r.read(tag::SEQUENCE)?;
+    let mut d = data.reader();
+    let data_type = read_oid(&mut d)?;
+    if data_type != oid::SPC_SIPINFO {
+        return Err(SignatureError::NotSipInfo(ObjectId::from_der(data_type)));
+    }
+    let value = d.read(tag::SEQUENCE)?;
+    d.finish()?;
+    let mut v = value.reader();
+    let version = read_small_uint(&mut v)?;
+    let guid = <[u8; 16]>::try_from(v.read(tag::OCTET_STRING)?.content)
+        .map_err(|_| SignatureError::SipInfo)?;
+    for _ in 0..5 {
+        read_small_uint(&mut v)?;
+    }
+    v.finish()?;
+
+    let (digest_alg, digest) = parse_digest_info(&mut r)?;
+    Ok((
+        IndirectData {
+            content: seq.content,
+            digest_alg,
+            digest,
+            pe_image_flags: None,
+            page_hashes: None,
+        },
+        SipInfo { version, guid },
+    ))
 }
 
 /// An `SpcLink` (`[0] IMPLICIT IA5String url`, `[1] IMPLICIT
@@ -475,6 +556,7 @@ fn parse_signer_info<'a>(
         opus: auth.opus,
         statement_type: auth.statement_type,
         signing_time: auth.signing_time,
+        signed_metadata: auth.signed_metadata,
         sig_alg,
         signature,
         nested,
@@ -519,6 +601,7 @@ struct Authenticated<'a> {
     opus: Opus,
     statement_type: Option<StatementType>,
     signing_time: Option<i64>,
+    signed_metadata: SignedMetadata,
 }
 
 /// Reads one `Attribute ::= SEQUENCE { type OID, values SET }`.
@@ -556,6 +639,8 @@ fn parse_authenticated_attributes<'a>(
     let mut opus = None;
     let mut statement_type = None;
     let mut signing_time = None;
+    let mut signed_metadata = SignedMetadata::default();
+    let mut metadata_seen = [false; 10];
     while !r.is_empty() {
         let (attr_type, values) = read_attribute(&mut r)?;
         let duplicate = || SignatureError::DuplicateAttribute(ObjectId::from_der(attr_type));
@@ -593,12 +678,30 @@ fn parse_authenticated_attributes<'a>(
                     return Err(duplicate());
                 }
             }
-            other => {
-                asn1::validate(&values)?;
-                warnings.push(SignatureWarning::UnknownAuthenticatedAttribute(
-                    ObjectId::from_der(other),
-                ));
-            }
+            other => match signed_metadata_arc(other) {
+                Some(arc) => {
+                    let seen = metadata_seen
+                        .get_mut(usize::from(arc) - 1)
+                        .ok_or_else(duplicate)?;
+                    if std::mem::replace(seen, true) {
+                        return Err(duplicate());
+                    }
+                    let value = single_value(attr_type, &values)?;
+                    asn1::validate(&value)?;
+                    match (signed_metadata_text(&value), signed_metadata.field_mut(arc)) {
+                        (Some(text), Some(field)) => *field = Some(text),
+                        _ => warnings.push(SignatureWarning::SignedMetadataUnreadable(
+                            ObjectId::from_der(other),
+                        )),
+                    }
+                }
+                None => {
+                    asn1::validate(&values)?;
+                    warnings.push(SignatureWarning::UnknownAuthenticatedAttribute(
+                        ObjectId::from_der(other),
+                    ));
+                }
+            },
         }
     }
     let content_type = content_type
@@ -615,7 +718,32 @@ fn parse_authenticated_attributes<'a>(
         opus: opus.unwrap_or_default(),
         statement_type,
         signing_time,
+        signed_metadata,
     })
+}
+
+/// The final arc (1 to 10) of a signed metadata attribute type
+/// (1.3.6.1.4.1.311.2.7.1 to .10), or `None` for any other type.
+fn signed_metadata_arc(attr_type: &[u8]) -> Option<u8> {
+    match attr_type.strip_prefix(oid::SIGNED_METADATA_ARC)? {
+        [arc @ 1..=10] => Some(*arc),
+        _ => None,
+    }
+}
+
+/// A signed metadata value: a UTF8String that is valid UTF-8, has no NUL
+/// (which a reader of C strings would cut at) and is at most
+/// [`asn1::MAX_TEXT_CHARS`] characters. Anything else is `None`: a value
+/// that cannot be read exactly is not read at all.
+fn signed_metadata_text(value: &Tlv<'_>) -> Option<String> {
+    if value.tag != tag::UTF8_STRING {
+        return None;
+    }
+    let text = std::str::from_utf8(value.content).ok()?;
+    if text.contains('\0') || text.chars().count() > asn1::MAX_TEXT_CHARS {
+        return None;
+    }
+    Some(text.to_owned())
 }
 
 /// `SpcSpOpusInfo ::= SEQUENCE { programName [0] EXPLICIT SpcString

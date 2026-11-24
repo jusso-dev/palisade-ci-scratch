@@ -10,6 +10,7 @@
 #   cargo +nightly fuzz run x509_chain
 #   cargo +nightly fuzz run timestamp_crl
 #   cargo +nightly fuzz run fuzz_ctl
+#   cargo +nightly fuzz run script_sig
 [package]
 name = "palisade-fileid-fuzz"
 version = "0.0.0"
@@ -78,6 +79,13 @@ bench = false
 [[bin]]
 name = "fuzz_ctl"
 path = "fuzz_targets/fuzz_ctl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_sig"
+path = "fuzz_targets/script_sig.rs"
 test = false
 doc = false
 bench = false

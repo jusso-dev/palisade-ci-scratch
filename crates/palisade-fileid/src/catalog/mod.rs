@@ -382,6 +382,7 @@ fn check(envelope: &pkcs7::Envelope<'_>, content: &[u8]) -> SignatureInfo {
             statement_type: signer.statement_type,
             signing_time: signer.signing_time,
             signer_cert: *i,
+            signed_metadata: signer.signed_metadata.clone(),
         }),
         _ => None,
     };

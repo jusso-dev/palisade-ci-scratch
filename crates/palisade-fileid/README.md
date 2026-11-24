@@ -2,7 +2,7 @@
 
 File identity: PE parsing, hashing (SHA-256, Authenticode, page and flat hashes), signature and certificate chain extraction, and version-info metadata.
 
-**Status:** early. PE header and version-resource parsing, flat hashing, the Authenticode image hash, page hashes, Authenticode signature verification, certificate chains, signer trust and signer identity, timestamps, expiry and revocation, and catalog parsing, catalog signatures and the catalog member index work; the rest of [#3](https://github.com/jusso-dev/palisade/issues/3) is still to come.
+**Status:** early. PE header and version-resource parsing, flat hashing, the Authenticode image hash, page hashes, Authenticode signature verification, certificate chains, signer trust and signer identity, timestamps, expiry and revocation, catalog parsing, catalog signatures and the catalog member index, and script signature blocks and signed metadata work; the rest of [#3](https://github.com/jusso-dev/palisade/issues/3) is still to come.
 
 ## What is here
 
@@ -403,6 +403,47 @@ File identity: PE parsing, hashing (SHA-256, Authenticode, page and flat hashes)
   database cross-check (`CryptCATAdmin*`, behind `os-trust`). Folding a
   catalog match into the file's signing state (`CatalogValid`) is #55;
   catalog timestamps and expiry are #50.
+- `script`: script signature blocks and signed metadata
+  ([#52](https://github.com/jusso-dev/palisade/issues/52)).
+  - `verify_script` reads the embedded signature block of a PowerShell
+    script, module or data file (`# SIG # Begin signature block`), a
+    PowerShell XML file (`<!-- SIG # ... -->`), a managed object format file
+    (`/* SIG # ... */`), VBScript (`'' SIG ''`), JScript (`// SIG //`) or a
+    Windows Script File (`<signature>` with `** SIG **` lines). It computes
+    the digest the OS subject interface package does: UTF-16LE of the text
+    without the block and the CRLF before it; the PowerShell package hashes a
+    byte order mark as U+FEFF, the script host packages append the block's
+    position in UTF-16 units. The SignedData is checked with the same code as
+    PE signatures, and the result is one `SignatureKind::Script` signature
+    for `evaluate_trust` and `evaluate_validity`. A changed script is
+    `DigestMismatch`.
+  - Fails conservative: text without a byte order mark is read only when it
+    is ASCII (otherwise its digest depends on the machine's code page), and
+    invalid UTF-8 or UTF-16, two blocks, marker text anywhere else in the
+    file, a truncated, misplaced or non-CRLF block, non-strict base64,
+    trailing bytes and a signature for another format's package are all
+    invalid, never signed. Encoded scripts (`.vbe`, `.jse`) are unsigned with
+    an `UnsupportedEncoding` warning; files over 32 MiB (configurable) are
+    `TooLargeForSignatureCheck`.
+  - `SignedMetadata`: the signed metadata attributes (1.3.6.1.4.1.311.2.7.1
+    to .10: internal name, file and product version, description, product,
+    original file name, language, author, publish time, source URL), read
+    from every signature, PE ones included, into
+    `SignerAttributes::signed_metadata`. A value that is not an exact
+    UTF8String is left out with a warning; a duplicate is malformed.
+  - `evaluate_script_trust` builds the chain under a `ScriptAnchorPolicy`
+    (`OsRootStore`, `PolicyAnchors` or `Either`, the default) and records
+    which anchor set was used; the caller supplies the machine root store.
+  - `ScriptReport::normalised_hash` is the tolerant `script_hash_normalised`
+    (SHA-256 of the text without the block and byte order mark, line endings
+    turned into LF), for opt-in rules only. `catalog_digests` is the hook
+    for a catalog lookup.
+
+  Still to come: reading the OS root store and the OS trust-verification
+  cross-check (`os-trust`, #48/#95), catalog-signed scripts beyond the
+  lookup hook (#51, #55), feeding signed metadata into the file identity
+  record (#55), MSI and package identity (#53) and interpreter enforcement
+  (#92 to #95).
 
 ## Handling untrusted input
 
@@ -465,7 +506,14 @@ SHA-1, and an organisation catalog under its own test root). The tests
 build each unsigned catalog byte by byte, listing the synthetic PE image and
 a short text file, and osslsigncode signs them with throwaway test keys; a
 test checks that each fixture signs exactly that content. No OS catalog is
-committed. No private keys and no third-party binaries are
+committed. The script tests use scripts in `tests/fixtures/script`, written
+by its `generate.sh` and signed by jsign with a throwaway test CA, in every
+format, encoding (UTF-8, UTF-8 with BOM, UTF-16LE, UTF-16BE where the
+package signs it) and line ending (CRLF, LF, CR); a second implementation
+of the digest in the tests must agree with each. Cases no signer makes on
+request (signed metadata, broken blocks, nested signatures) are signed by
+the tests themselves with a key generated per run. On Windows, a test
+compares the verdicts with the OS's own. No private keys and no third-party binaries are
 committed; the `generate.sh` scripts document how every file was made and
 regenerate them.
 
