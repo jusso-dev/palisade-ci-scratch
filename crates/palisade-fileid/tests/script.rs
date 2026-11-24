@@ -25,6 +25,8 @@
     clippy::cast_possible_truncation
 )]
 
+mod common;
+
 use std::path::Path;
 
 use palisade_fileid::authenticode::{
@@ -635,10 +637,19 @@ impl Signer {
             &int(0),
             &int(0),
         ]);
-        let indirect = seq(&[
-            &seq(&[&oid("1.3.6.1.4.1.311.2.1.30"), &sip_info]),
-            &seq(&[&digest_alg(), &tlv(0x04, digest)]),
-        ]);
+        let data = seq(&[&oid("1.3.6.1.4.1.311.2.1.30"), &sip_info]);
+        self.signed_indirect(&data, digest, extra, nested)
+    }
+
+    /// A SignedData over `SpcIndirectDataContent { data, digest }`.
+    fn signed_indirect(
+        &self,
+        data: &[u8],
+        digest: &[u8],
+        extra: &[Vec<u8>],
+        nested: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let indirect = seq(&[data, &seq(&[&digest_alg(), &tlv(0x04, digest)])]);
         let indirect_content = &indirect[header_len(&indirect)..];
         let message_digest = Sha256::digest(indirect_content);
         let mut attrs = vec![
@@ -839,6 +850,54 @@ fn every_signed_metadata_attribute_is_read_back() {
             "Palisade Script Test Signer".to_owned(),
             "Palisade Tools".to_owned()
         ))
+    );
+}
+
+#[test]
+fn signed_metadata_is_read_from_pe_signatures() {
+    use palisade_fileid::authenticode::verify_pe;
+    use palisade_fileid::hash::{AlgorithmSet, HashAlgorithm};
+    let signer = Signer::new();
+    let unsigned = common::PeBuilder::default().build();
+    let digest = palisade_fileid::authenticode::hash_pe(&unsigned, AlgorithmSet::SHA256)
+        .unwrap()
+        .get(HashAlgorithm::Sha256)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    // SPC_PE_IMAGE_DATA, with no optional value.
+    let data = seq(&[&oid("1.3.6.1.4.1.311.2.1.15")]);
+    let der = signer.signed_indirect(
+        &data,
+        &digest,
+        &[
+            metadata_attr(6, &utf8("Palisade.exe")),
+            metadata_attr(2, &utf8("1.2.3.4")),
+        ],
+        None,
+    );
+    let mut entry = ((der.len() + 8) as u32).to_le_bytes().to_vec();
+    entry.extend_from_slice(&0x0200_u16.to_le_bytes());
+    entry.extend_from_slice(&2_u16.to_le_bytes());
+    entry.extend_from_slice(&der);
+    while entry.len() % 8 != 0 {
+        entry.push(0);
+    }
+    let image = common::PeBuilder {
+        certificate: Some(entry),
+        ..common::PeBuilder::default()
+    }
+    .build();
+    let report = verify_pe(&image, &Default::default()).unwrap();
+    let sig = &report.signatures[0];
+    assert_eq!(sig.status, SignatureStatus::Valid, "{sig:#?}");
+    assert_eq!(
+        sig.signer.as_ref().unwrap().signed_metadata,
+        SignedMetadata {
+            original_filename: Some("Palisade.exe".into()),
+            file_version: Some("1.2.3.4".into()),
+            ..SignedMetadata::default()
+        }
     );
 }
 
@@ -1354,6 +1413,137 @@ fn extensions() {
     assert_eq!(ScriptKind::from_path(Path::new("noext")), None);
 }
 
+#[test]
+fn unreadable_blocks_are_invalid_in_both_states() {
+    // A block that cannot be read must not leave the signature report
+    // "unsigned": validity evaluation must call it malformed.
+    use palisade_fileid::authenticode::{
+        InvalidReason, RevocationSet, ValidityContext, ValidityPolicy, VerificationError,
+        evaluate_trust, evaluate_validity,
+    };
+    let policy = ValidityPolicy::default();
+    let revocation = RevocationSet::default();
+    let tsa = TrustConfig::new();
+    let ctx = ValidityContext {
+        now: 1_800_000_000,
+        clock_floor: None,
+        policy: &policy,
+        revocation: &revocation,
+        tsa_trust: &tsa,
+        file_digests: &[],
+        version: None,
+    };
+    let (_, good) = signed_text();
+    let cases = [
+        format!("{good}{good}"),
+        good.replace(PS_BEGIN, "# SIG # Begin"),
+        good.strip_suffix("\r\n").unwrap().to_owned(),
+        format!("{good}x\r\n"),
+    ];
+    let mut bad_text = b"\xef\xbb\xbf\xff".to_vec();
+    bad_text.extend_from_slice(good.as_bytes());
+    let mut reports: Vec<ScriptReport> = cases.iter().map(|c| verify_text(c)).collect();
+    reports.push(verify(&bad_text, ScriptKind::PowerShell));
+    for report in reports {
+        assert!(
+            matches!(report.signing_state, ScriptSigningState::Invalid(_)),
+            "{:?}",
+            report.signing_state
+        );
+        assert_eq!(
+            report.signatures.signing_state,
+            SigningState::Invalid(InvalidReason::ScriptSignatureBlock)
+        );
+        let trust = evaluate_trust(&report.signatures, &TrustConfig::new(), None);
+        let validity = evaluate_validity(&report.signatures, &trust, &ctx);
+        assert_eq!(validity.error, VerificationError::MalformedSignature);
+    }
+}
+
+#[test]
+fn empty_text_has_no_identity() {
+    for kind in [
+        ScriptKind::PowerShell,
+        ScriptKind::VbScript,
+        ScriptKind::JScript,
+    ] {
+        for data in [&b""[..], b"\xef\xbb\xbf", b"\xff\xfe"] {
+            let report = verify(data, kind);
+            assert_eq!(report.signing_state, ScriptSigningState::Unsigned);
+            assert!(report.empty_text, "{kind:?} {data:?}");
+            assert!(report.normalised_hash.is_none());
+            assert_eq!(
+                report.catalog_digests(),
+                palisade_fileid::catalog::FileDigests::default()
+            );
+        }
+        let report = verify(b"x", kind);
+        assert!(!report.empty_text);
+        assert!(report.normalised_hash.is_some());
+    }
+    // A file holding only a signature block: the signature is checked, but
+    // the (empty) text has no identity.
+    let signer = Signer::new();
+    let probe = ps_block(&[0]);
+    let digest = sip_digest(probe.as_bytes(), "ps1");
+    let der = signer.signed_data(&digest, POWERSHELL_SIP, 0x0001_0000, &[], None);
+    let only_block = ps_block(&der);
+    let report = verify(only_block.as_bytes(), ScriptKind::PowerShell);
+    assert!(report.empty_text);
+    assert!(report.normalised_hash.is_none());
+    assert_eq!(
+        report.catalog_digests(),
+        palisade_fileid::catalog::FileDigests::default()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_script_file_refuses_non_files_without_blocking() {
+    let dir = std::env::temp_dir().join(format!("palisade-script-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe.ps1");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(verify_script_file(
+            &path,
+            ScriptKind::PowerShell,
+            &ScriptOptions::default(),
+        ));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("verify_script_file blocked on a FIFO");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A directory and a device are refused too.
+    for path in [Path::new(FIXTURES), Path::new("/dev/zero")] {
+        let err = verify_script_file(path, ScriptKind::PowerShell, &ScriptOptions::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{path:?}");
+    }
+}
+
+#[test]
+fn encoded_script_files_are_not_read() {
+    let path = Path::new(FIXTURES).join("vbs-utf8-crlf.vbs");
+    let tiny = ScriptOptions {
+        max_size: 1,
+        ..ScriptOptions::default()
+    };
+    // Even over the size limit: it is not read, so it is unsigned.
+    let report = verify_script_file(&path, ScriptKind::EncodedVbScript, &tiny).unwrap();
+    assert_eq!(report.signing_state, ScriptSigningState::Unsigned);
+    assert_eq!(report.warnings, vec![ScriptWarning::UnsupportedEncoding]);
+    assert_eq!(report.size, std::fs::metadata(&path).unwrap().len());
+}
+
 // ---------------------------------------------------------------------------
 // Trust.
 
@@ -1403,6 +1593,32 @@ fn trust_anchor_policy() {
         }
     }
     assert_eq!(ScriptAnchorPolicy::default(), Either);
+}
+
+#[test]
+fn blank_products_make_no_publisher_product() {
+    let signer = Signer::new();
+    let policy = signer.trust();
+    for product in ["", "   ", "Tools\u{7}", "Tools\nOther"] {
+        let data = sign_ps1(&signer, BODY, &[metadata_attr(4, &utf8(product))]);
+        let report = verify(&data, ScriptKind::PowerShell);
+        assert_eq!(report.signing_state, ScriptSigningState::Valid);
+        let trust = evaluate_script_trust(
+            &report,
+            &ScriptTrustAnchors {
+                policy: &policy,
+                os_root_store: None,
+            },
+            ScriptAnchorPolicy::PolicyAnchors,
+        );
+        assert!(trust.anchor.is_some());
+        // The metadata is reported as signed, but never as an identity.
+        assert_eq!(
+            trust.signed_metadata.unwrap().product.as_deref(),
+            Some(product)
+        );
+        assert_eq!(trust.publisher_product, None, "{product:?}");
+    }
 }
 
 #[test]
@@ -1495,13 +1711,11 @@ fn os_trust_verification_agrees() {
     let list = dir.join("paths.txt");
     let paths: Vec<String> = cases.iter().map(|(p, _)| p.display().to_string()).collect();
     std::fs::write(&list, paths.join("\r\n")).unwrap();
-    let script = format!(
-        "Get-Content -Encoding UTF8 -LiteralPath '{}' | ForEach-Object {{ \
-         (Get-AuthenticodeSignature -LiteralPath $_).Status.ToString() }}",
-        list.display()
-    );
+    let script = "Get-Content -Encoding UTF8 -LiteralPath $env:PALISADE_SCRIPT_LIST | \
+                  ForEach-Object { (Get-AuthenticodeSignature -LiteralPath $_).Status.ToString() }";
     let out = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env("PALISADE_SCRIPT_LIST", &list)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1665,4 +1879,19 @@ fn write_script_fuzz_seeds() {
         &[metadata_attr(4, &utf8("Palisade Tools"))],
     ));
     std::fs::write(dir.join("seed-metadata.ps1"), seed).unwrap();
+    let body = "class A {};\r\n";
+    let style = |der: &[u8]| {
+        block(
+            der,
+            "/* SIG # Begin signature block */",
+            "/* SIG # End signature block */",
+            "/* ",
+            " */",
+        )
+    };
+    let digest = sip_digest(format!("{body}{}", style(&[0])).as_bytes(), "mof");
+    let der = signer.signed_data(&digest, POWERSHELL_SIP, 0x0001_0000, &[], None);
+    let mut seed = vec![2];
+    seed.extend_from_slice(format!("{body}{}", style(&der)).as_bytes());
+    std::fs::write(dir.join("seed-signed.mof"), seed).unwrap();
 }

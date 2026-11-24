@@ -251,7 +251,7 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Catalog, CatalogError> {
     let mut whole = asn1::Reader::new(bytes, 0);
     whole
         .read(asn1::tag::SEQUENCE)
-        .and_then(|tlv| validate_strict(&tlv))
+        .and_then(|tlv| asn1::validate_strict(&tlv))
         .map_err(|e| CatalogError::Envelope(e.into()))?;
 
     let mut warnings = Vec::new();
@@ -295,48 +295,6 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Catalog, CatalogError> {
         signatures,
         warnings,
     })
-}
-
-/// [`asn1::validate`], plus a check of each primitive INTEGER, BOOLEAN,
-/// NULL and OBJECT IDENTIFIER's content. Iterative, at most
-/// [`asn1::MAX_DEPTH`] levels deep, like [`asn1::validate`].
-fn validate_strict(tlv: &asn1::Tlv<'_>) -> Result<(), asn1::Asn1Error> {
-    let mut stack: Vec<asn1::Reader<'_>> = Vec::new();
-    check_element(tlv, &mut stack)?;
-    while let Some(top) = stack.last_mut() {
-        if top.is_empty() {
-            stack.pop();
-            continue;
-        }
-        let child = top.read_any()?;
-        check_element(&child, &mut stack)?;
-    }
-    Ok(())
-}
-
-/// Checks one element for [`validate_strict`]: a primitive's content, or,
-/// for a constructed element, pushes a reader over its children.
-fn check_element<'a>(
-    element: &asn1::Tlv<'a>,
-    stack: &mut Vec<asn1::Reader<'a>>,
-) -> Result<(), asn1::Asn1Error> {
-    use asn1::tag;
-    match element.tag {
-        tag::INTEGER => asn1::integer_bytes(element).map(|_| ()),
-        tag::BOOLEAN => asn1::boolean(element).map(|_| ()),
-        tag::OID => asn1::oid_bytes(element).map(|_| ()),
-        tag::NULL if !element.content.is_empty() => {
-            Err(element.error(asn1::Asn1ErrorKind::InvalidValue))
-        }
-        constructed if constructed & 0x20 != 0 => {
-            if stack.len() >= asn1::MAX_DEPTH {
-                return Err(element.error(asn1::Asn1ErrorKind::TooDeep));
-            }
-            stack.push(element.reader());
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Checks the catalog's SignerInfo over `content`, the CTL's content

@@ -602,6 +602,43 @@ pub(crate) fn validate(tlv: &Tlv<'_>) -> Result<()> {
     Ok(())
 }
 
+/// [`validate`], plus a check of each primitive INTEGER, BOOLEAN,
+/// NULL and OBJECT IDENTIFIER's content. Iterative, at most
+/// [`MAX_DEPTH`] levels deep, like [`validate`]. Used for the parts of
+/// catalog (#51) and script (#52) signatures no decoder reads.
+pub(crate) fn validate_strict(tlv: &Tlv<'_>) -> Result<()> {
+    let mut stack: Vec<Reader<'_>> = Vec::new();
+    check_element(tlv, &mut stack)?;
+    while let Some(top) = stack.last_mut() {
+        if top.is_empty() {
+            stack.pop();
+            continue;
+        }
+        let child = top.read_any()?;
+        check_element(&child, &mut stack)?;
+    }
+    Ok(())
+}
+
+/// Checks one element for [`validate_strict`]: a primitive's content, or,
+/// for a constructed element, pushes a reader over its children.
+fn check_element<'a>(element: &Tlv<'a>, stack: &mut Vec<Reader<'a>>) -> Result<()> {
+    match element.tag {
+        tag::INTEGER => integer_bytes(element).map(|_| ()),
+        tag::BOOLEAN => boolean(element).map(|_| ()),
+        tag::OID => oid_bytes(element).map(|_| ()),
+        tag::NULL if !element.content.is_empty() => Err(element.error(Asn1ErrorKind::InvalidValue)),
+        constructed if constructed & 0x20 != 0 => {
+            if stack.len() >= MAX_DEPTH {
+                return Err(element.error(Asn1ErrorKind::TooDeep));
+            }
+            stack.push(element.reader());
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The longest text read from a signature, in characters. Longer strings are
 /// cut, and the caller records a warning.
 pub(crate) const MAX_TEXT_CHARS: usize = 4096;

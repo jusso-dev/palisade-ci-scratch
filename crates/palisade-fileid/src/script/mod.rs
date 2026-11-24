@@ -510,13 +510,20 @@ pub struct ScriptReport {
     /// decode, and for an unsigned `.wsf`, whose block position the package
     /// would choose.
     pub sip_digests: Option<FlatHashes>,
+    /// Whether the script's text outside the block is empty (an empty or
+    /// BOM-only file, or one holding only a signature block). Its digests
+    /// are then well-known constants, never a file identity:
+    /// [`Self::normalised_hash`] is `None` and [`Self::catalog_digests`]
+    /// is empty. A signature over such text is still checked.
+    pub empty_text: bool,
     /// `script_hash_normalised`: the SHA-256 of the UTF-8 text without the
     /// block and its preceding line break, without the byte order mark,
     /// and with every CRLF and lone CR turned into LF. A **tolerant**
     /// identity (weak-medium), for explicit opt-in rules only: it stays the
     /// same when a script is re-encoded, its line endings change, or it is
     /// signed or re-signed. The flat hash stays the default identity.
-    /// `None` when the text was not read or does not decode.
+    /// `None` when the text was not read, does not decode, or is empty
+    /// ([`Self::empty_text`]).
     pub normalised_hash: Option<Digest>,
     /// Anything unusual.
     pub warnings: Vec<ScriptWarning>,
@@ -533,9 +540,13 @@ impl ScriptReport {
     /// [`crate::catalog::CatalogStore`] with: the package digests, as the
     /// non-PE (flat) digests a catalog lists a script under. Matching them
     /// against catalogs made by OS tooling is still to be checked (#51), so
-    /// a miss does not show that no catalog lists the script.
+    /// a miss does not show that no catalog lists the script. Empty for
+    /// empty text ([`Self::empty_text`]), whose digest identifies nothing.
     #[must_use]
     pub fn catalog_digests(&self) -> FileDigests {
+        if self.empty_text {
+            return FileDigests::default();
+        }
         let get = |alg| self.sip_digests.as_ref()?.get(alg).cloned();
         FileDigests {
             flat_sha256: get(HashAlgorithm::Sha256),
@@ -571,9 +582,17 @@ fn not_read(kind: ScriptKind, options: &ScriptOptions) -> ScriptReport {
             ..empty_signatures()
         },
         sip_digests: None,
+        empty_text: false,
         normalised_hash: None,
         warnings: Vec::new(),
     }
+}
+
+/// Records that `report`'s script carries a signature that could not be
+/// read, in both signing states, so neither reads as unsigned.
+fn unreadable(report: &mut ScriptReport, why: ScriptInvalidReason) {
+    report.signatures.signing_state = SigningState::Invalid(InvalidReason::ScriptSignatureBlock);
+    report.signing_state = ScriptSigningState::Invalid(why);
 }
 
 /// Reads the script `data` as `kind` and checks its signature block.
@@ -605,20 +624,25 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
 
     // Find the block. Markers are compared as exact ASCII text, which is
     // exact in every encoding read here.
-    let invalid = ScriptSigningState::Invalid;
     let block = match (text.count(style.begin), text.count(style.end)) {
         (0, 0) => None,
         (b, e) if b > 1 || e > 1 => {
-            report.signing_state = invalid(ScriptInvalidReason::Block(BlockError::MultipleBlocks));
+            unreadable(
+                &mut report,
+                ScriptInvalidReason::Block(BlockError::MultipleBlocks),
+            );
             return report;
         }
         (0, _) => {
-            report.signing_state = invalid(ScriptInvalidReason::Block(BlockError::MissingBegin));
+            unreadable(
+                &mut report,
+                ScriptInvalidReason::Block(BlockError::MissingBegin),
+            );
             return report;
         }
         _ => {
             if let Some(issue) = issue {
-                report.signing_state = invalid(ScriptInvalidReason::Text(issue));
+                unreadable(&mut report, ScriptInvalidReason::Text(issue));
                 return report;
             }
             let parsed = text
@@ -628,7 +652,7 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
             match parsed {
                 Ok(block) => Some(block),
                 Err(e) => {
-                    report.signing_state = invalid(ScriptInvalidReason::Block(e));
+                    unreadable(&mut report, ScriptInvalidReason::Block(e));
                     return report;
                 }
             }
@@ -645,7 +669,10 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         if !style.allows_text_after {
             report.sip_digests = digests.sip;
         }
-        report.normalised_hash = digests.normalised;
+        report.empty_text = digests.empty;
+        if !digests.empty {
+            report.normalised_hash = digests.normalised;
+        }
         return report;
     };
     report.block = Some(BlockLocation {
@@ -656,16 +683,23 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
     });
 
     let der = match text::decode_base64(&block.payload) {
-        Some(der) => der,
+        Some(der) if der.len() <= MAX_SIGNATURE_SIZE => der,
+        Some(_) => {
+            unreadable(
+                &mut report,
+                ScriptInvalidReason::Block(BlockError::TooLarge),
+            );
+            return report;
+        }
         None => {
-            report.signing_state = invalid(ScriptInvalidReason::Block(BlockError::Base64));
+            unreadable(&mut report, ScriptInvalidReason::Block(BlockError::Base64));
             return report;
         }
     };
     let signed = match parse_signature(&der, style) {
         Ok(signed) => signed,
         Err(Parse::Block(e)) => {
-            report.signing_state = invalid(ScriptInvalidReason::Block(e));
+            unreadable(&mut report, ScriptInvalidReason::Block(e));
             return report;
         }
         Err(Parse::Signature(e)) => {
@@ -678,7 +712,7 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
                 SignatureStatus::Malformed(e.clone()),
             ));
             report.signatures.signatures.push(info);
-            report.signing_state = invalid(ScriptInvalidReason::Signature(
+            report.signing_state = ScriptSigningState::Invalid(ScriptInvalidReason::Signature(
                 SignatureStatus::Malformed(e),
             ));
             return report;
@@ -696,7 +730,10 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         algorithms.insert(alg);
     }
     let digests = text.digests(Some(&block), style, algorithms);
-    report.normalised_hash = digests.normalised;
+    report.empty_text = digests.empty;
+    if !digests.empty {
+        report.normalised_hash = digests.normalised;
+    }
     let script_digests = AuthenticodeHashes {
         digests: digests
             .sip
@@ -728,7 +765,7 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
     report.signing_state = match &info.status {
         SignatureStatus::Valid => ScriptSigningState::Valid,
         SignatureStatus::DigestMismatch => ScriptSigningState::DigestMismatch,
-        other => invalid(ScriptInvalidReason::Signature(other.clone())),
+        other => ScriptSigningState::Invalid(ScriptInvalidReason::Signature(other.clone())),
     };
     let valid = info.status.is_valid();
     report.signatures.signing_state = if valid {
@@ -756,11 +793,12 @@ fn parse_signature<'a>(der: &'a [u8], style: &Style) -> Result<pkcs7::SignedData
     if !trailing.is_empty() {
         return Err(Parse::Block(BlockError::TrailingData));
     }
-    // Nested signatures are not decoded; they must still be DER.
+    // Nested signatures are not decoded; they must still be DER, with
+    // valid primitives, as for catalogs.
     let mut whole = asn1::Reader::new(der, 0);
     whole
         .read(asn1::tag::SEQUENCE)
-        .and_then(|tlv| asn1::validate(&tlv))
+        .and_then(|tlv| asn1::validate_strict(&tlv))
         .map_err(|e| Parse::Signature(e.into()))?;
     if sip.guid != style.sip_guid || sip.version != style.sip_version {
         return Err(Parse::Signature(SignatureError::SipMismatch));
@@ -769,14 +807,34 @@ fn parse_signature<'a>(der: &'a [u8], style: &Style) -> Result<pkcs7::SignedData
 }
 
 /// Reads the script at `path` as `kind`, within [`ScriptOptions::max_size`]
-/// (a larger file is not read), and checks its signature block.
+/// (a larger file is not read), and checks its signature block. Fails with
+/// [`std::io::ErrorKind::InvalidInput`] for anything but a regular file,
+/// without blocking on a FIFO. An encoded script is not read at all.
 pub fn verify_script_file(
     path: &Path,
     kind: ScriptKind,
     options: &ScriptOptions,
 ) -> std::io::Result<ScriptReport> {
-    let file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
+    // As `crate::hash::hash_file`: pipes and devices have no stable
+    // content. The path is checked first; it can be replaced after that,
+    // so the open must not block on a FIFO, and the opened handle decides.
+    let not_a_file = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_a_file());
+    }
+    let file = crate::hash::open_without_blocking(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_a_file());
+    }
+    let size = metadata.len();
+    if kind.is_encoded() {
+        // Encoded scripts are never read.
+        return Ok(ScriptReport {
+            size,
+            ..verify_script(&[], kind, options)
+        });
+    }
     if size > options.max_size {
         return Ok(ScriptReport {
             size,
@@ -852,7 +910,12 @@ pub struct ScriptTrust {
 }
 
 /// Builds the chain of `report`'s signature against the anchor sets
-/// `policy` allows, and decides whether its signer is trusted. Expiry,
+/// `policy` allows, and decides whether its signer is trusted. Only a
+/// [`ScriptSigningState::Valid`] script is ever trusted; check
+/// [`ScriptReport::signing_state`] for why another is not, since its
+/// [`ScriptReport::signatures`] holds no signature when the block itself
+/// could not be read (its state is then
+/// [`crate::authenticode::InvalidReason::ScriptSignatureBlock`]). Expiry,
 /// timestamps and revocation are
 /// [`crate::authenticode::evaluate_validity`], with
 /// [`ScriptReport::signatures`] and [`ScriptTrust::trust`].
@@ -887,11 +950,18 @@ pub fn evaluate_script_trust(
             .and_then(|s| s.signer.as_ref())
             .map(|a| a.signed_metadata.clone());
         if let Some(signed_metadata) = signed_metadata {
+            // As for a version resource's product name: a blank or
+            // control-bearing product never makes a publisher plus
+            // product identity.
+            let product = signed_metadata
+                .product
+                .as_ref()
+                .filter(|p| !p.trim().is_empty() && !p.chars().any(char::is_control));
             let publisher_product = trust
                 .identity
                 .as_ref()
                 .and_then(|i| i.publisher_name.as_ref())
-                .zip(signed_metadata.product.as_ref())
+                .zip(product)
                 .map(|(p, product)| (p.value.clone(), product.clone()));
             return ScriptTrust {
                 policy,

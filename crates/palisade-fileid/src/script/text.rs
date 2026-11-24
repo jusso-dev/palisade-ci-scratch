@@ -280,6 +280,7 @@ impl<'a> Text<'a> {
         let position = self.feed(before.0, before.1, &mut sink);
         let rest = self.feed(after.0, after.1, &mut sink);
         let decoded = position.is_some() && rest.is_some();
+        let empty = position.unwrap_or(0) == 0 && rest.unwrap_or(0) == 0;
         if style.hashes_position {
             // The block's position in the text, in UTF-16 units, as a
             // 32-bit little-endian integer.
@@ -292,7 +293,9 @@ impl<'a> Text<'a> {
             sink.sip = None;
             sink.normalised = None;
         }
-        sink.finish()
+        let mut digests = sink.finish();
+        digests.empty = empty;
+        digests
     }
 }
 
@@ -318,6 +321,9 @@ pub(super) struct Digests {
     pub sip: Option<FlatHashes>,
     /// The normalised script hash, SHA-256.
     pub normalised: Option<Digest>,
+    /// Whether the text outside the block is empty, so every digest is a
+    /// well-known constant.
+    pub empty: bool,
 }
 
 /// Feeds the UTF-16LE stream to the subject interface package digest and
@@ -386,7 +392,11 @@ impl Sink {
             h.update(&self.norm_buf);
             h.finalize().get(HashAlgorithm::Sha256).cloned()
         });
-        Digests { sip, normalised }
+        Digests {
+            sip,
+            normalised,
+            empty: false,
+        }
     }
 }
 
