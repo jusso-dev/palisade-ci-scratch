@@ -407,7 +407,7 @@ File identity: PE parsing, hashing (SHA-256, Authenticode, page and flat hashes)
   ([#52](https://github.com/jusso-dev/palisade/issues/52)).
   - `verify_script` reads the embedded signature block of a PowerShell
     script, module or data file (`# SIG # Begin signature block`), a
-    PowerShell XML file (`<!-- SIG # ... -->`), a managed object format file
+    PowerShell XML file (an XML comment around `SIG # ...`), a managed object format file
     (`/* SIG # ... */`), VBScript (`'' SIG ''`), JScript (`// SIG //`) or a
     Windows Script File (`<signature>` with `** SIG **` lines). It computes
     the digest the OS subject interface package does: UTF-16LE of the text
