@@ -1711,26 +1711,35 @@ fn os_trust_verification_agrees() {
     let list = dir.join("paths.txt");
     let paths: Vec<String> = cases.iter().map(|(p, _)| p.display().to_string()).collect();
     std::fs::write(&list, paths.join("\r\n")).unwrap();
-    let script = "Get-Content -Encoding UTF8 -LiteralPath $env:PALISADE_SCRIPT_LIST | \
+    // `Stop` turns any per-file error into a failing exit with a message,
+    // instead of a silently missing status line.
+    let script = "$ErrorActionPreference = 'Stop'; \
+                  Get-Content -Encoding UTF8 -LiteralPath $env:PALISADE_SCRIPT_LIST | \
                   ForEach-Object { (Get-AuthenticodeSignature -LiteralPath $_).Status.ToString() }";
+    // A test run started from PowerShell 7 (the CI default shell) passes its
+    // module path on, and Windows PowerShell then fails to load its own
+    // built-in security module, which provides `Get-AuthenticodeSignature`.
+    // Let it use its default path.
     let out = std::process::Command::new("powershell.exe")
         .env("PALISADE_SCRIPT_LIST", &list)
+        .env_remove("PSModulePath")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
     let statuses: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
         .collect();
-    assert_eq!(statuses.len(), cases.len(), "{statuses:?}");
+    assert_eq!(
+        statuses.len(),
+        cases.len(),
+        "statuses {statuses:?}; stderr {stderr}"
+    );
     for ((path, ours), os) in cases.iter().zip(&statuses) {
         match ours {
             ScriptSigningState::Valid => assert!(
