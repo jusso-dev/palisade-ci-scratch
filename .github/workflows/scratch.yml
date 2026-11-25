@@ -6,21 +6,20 @@ permissions:
   contents: read
 jobs:
   windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: OS signer probe
+      - name: OS-signed fixtures
         shell: powershell
         run: |
           Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scratch/probe.ps1
-      - run: rustup toolchain install
-      - name: differential test
-        run: cargo test -p palisade-fileid --test script os_trust_verification_agrees -- --nocapture
+          $out = Join-Path $env:RUNNER_TEMP 'osfix'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File crates/palisade-fileid/tests/fixtures/script/generate-os.ps1 $out
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem $out | ForEach-Object {
+            $g = Get-AuthenticodeSignature -LiteralPath $_.FullName
+            "OSFIX|$($_.Name)|$($g.Status)|$([Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)))"
+          }
