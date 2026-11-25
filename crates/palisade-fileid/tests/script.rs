@@ -1687,9 +1687,11 @@ fn signature_digest_algorithm_is_recorded() {
 
 /// On Windows, the OS's own verdict on every fixture and on a copy with
 /// one character changed: whenever this crate says a script is validly
-/// signed the OS must not report a hash mismatch or no signature, and
-/// whenever this crate says the digest does not match, the OS must say so
-/// too. Trust is not compared: the fixtures' root is in no store.
+/// signed the OS must say the signature itself is sound (valid, or valid
+/// but its root not trusted), and whenever this crate says the digest does
+/// not match, the OS must say so too. Trust is not compared: the fixtures'
+/// root is in no store. Every disagreement is collected and reported, not
+/// only the first.
 #[cfg(windows)]
 #[test]
 fn os_trust_verification_agrees() {
@@ -1712,10 +1714,13 @@ fn os_trust_verification_agrees() {
     let paths: Vec<String> = cases.iter().map(|(p, _)| p.display().to_string()).collect();
     std::fs::write(&list, paths.join("\r\n")).unwrap();
     // `Stop` turns any per-file error into a failing exit with a message,
-    // instead of a silently missing status line.
+    // instead of a silently missing status line. Each line is the status
+    // and the OS's own result code for it, from the signature's status
+    // message.
     let script = "$ErrorActionPreference = 'Stop'; \
                   Get-Content -Encoding UTF8 -LiteralPath $env:PALISADE_SCRIPT_LIST | \
-                  ForEach-Object { (Get-AuthenticodeSignature -LiteralPath $_).Status.ToString() }";
+                  ForEach-Object { $s = Get-AuthenticodeSignature -LiteralPath $_; \
+                  $s.Status.ToString() + '|' + ($s.StatusMessage -replace '\\s+', ' ') }";
     // A test run started from PowerShell 7 (the CI default shell) passes its
     // module path on, and Windows PowerShell then fails to load its own
     // built-in security module, which provides `Get-AuthenticodeSignature`.
@@ -1729,30 +1734,51 @@ fn os_trust_verification_agrees() {
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{stderr}");
-    let statuses: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let statuses: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(str::to_owned)
+        .map(|l| {
+            let (status, message) = l.split_once('|').unwrap_or((l, ""));
+            (status.to_owned(), message.trim().to_owned())
+        })
         .collect();
     assert_eq!(
         statuses.len(),
         cases.len(),
         "statuses {statuses:?}; stderr {stderr}"
     );
-    for ((path, ours), os) in cases.iter().zip(&statuses) {
-        match ours {
-            ScriptSigningState::Valid => assert!(
-                os != "HashMismatch" && os != "NotSigned" && os != "Incompatible",
-                "{}: valid here, {os} for the OS",
-                path.display()
-            ),
-            ScriptSigningState::DigestMismatch => {
-                assert_eq!(os, "HashMismatch", "{}", path.display());
+    let mut disagreements = Vec::new();
+    for ((path, ours), (os, message)) in cases.iter().zip(&statuses) {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let agrees = match ours {
+            // A sound signature whose root is in no store: the OS reports
+            // it valid, or unknown with the untrusted-root message.
+            ScriptSigningState::Valid => {
+                os == "Valid" || (os == "UnknownError" && untrusted_root(message))
             }
-            other => panic!("{}: unexpected {other:?}", path.display()),
+            ScriptSigningState::DigestMismatch => os == "HashMismatch",
+            _ => false,
+        };
+        eprintln!("{name}: ours {ours:?}, OS {os} ({message})");
+        if !agrees {
+            disagreements.push(format!("{name}: ours {ours:?}, OS {os} ({message})"));
         }
     }
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} disagree:\n{}",
+        disagreements.len(),
+        cases.len(),
+        disagreements.join("\n")
+    );
+}
+
+/// Whether an OS status message is the one for a chain that ends in a root
+/// no store trusts, and nothing else.
+#[cfg(windows)]
+fn untrusted_root(message: &str) -> bool {
+    message.contains("root certificate which is not trusted")
 }
 
 // ---------------------------------------------------------------------------
