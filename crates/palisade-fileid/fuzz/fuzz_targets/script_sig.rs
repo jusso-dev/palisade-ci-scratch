@@ -8,7 +8,7 @@ use libfuzzer_sys::fuzz_target;
 use palisade_fileid::authenticode::{SignatureKind, SignatureStatus, TrustConfig};
 use palisade_fileid::script::{
     ScriptAnchorPolicy, ScriptKind, ScriptOptions, ScriptSigningState, ScriptTrustAnchors,
-    evaluate_script_trust, verify_script,
+    TextIssue, evaluate_script_trust, verify_script,
 };
 
 const KINDS: [ScriptKind; 8] = [
@@ -47,10 +47,14 @@ fuzz_target!(|data: &[u8]| {
     if report.signing_state == ScriptSigningState::DigestMismatch {
         assert_eq!(report.signature().unwrap().status, SignatureStatus::DigestMismatch);
     }
-    if report.text_issue.is_some() {
+    if let Some(issue) = report.text_issue {
         assert!(!valid);
         assert!(report.sip_digests.is_none());
-        assert!(report.normalised_hash.is_none());
+        // Non-ASCII UTF-8 script host text decodes, so it keeps its
+        // normalised hash; text that does not decode has none.
+        if issue != TextIssue::NonAsciiUtf8 {
+            assert!(report.normalised_hash.is_none());
+        }
     }
     if let Some(block) = report.block {
         assert!(block.offset.saturating_add(block.len) <= report.size);

@@ -536,9 +536,10 @@ pub struct ScriptReport {
     /// The package's digests of the text without the block (SHA-256,
     /// SHA-1 and the signature's own algorithm): what the signature, or a
     /// catalog, signs. `None` when the text was not read, does not decode
-    /// or has no defined package digest ([`TextIssue::NonAsciiUtf8`]), and
-    /// for an unsigned `.wsf`, whose block position the package would
-    /// choose.
+    /// or has no defined package digest ([`TextIssue::NonAsciiUtf8`]); when
+    /// the signature block's own structure cannot be read (a
+    /// [`BlockError`] before [`Self::block`] is set); and for an unsigned
+    /// `.wsf`, whose block position the package would choose.
     pub sip_digests: Option<FlatHashes>,
     /// Whether the script's text outside the block is empty (an empty or
     /// BOM-only file, or one holding only a signature block). Its digests
@@ -553,7 +554,8 @@ pub struct ScriptReport {
     /// same when a script is re-encoded, its line endings change, or it is
     /// signed or re-signed. The flat hash stays the default identity.
     /// `None` when the text was not read, does not decode, or is empty
-    /// ([`Self::empty_text`]).
+    /// ([`Self::empty_text`]), and when the signature block's own structure
+    /// cannot be read (a [`BlockError`] before [`Self::block`] is set).
     pub normalised_hash: Option<Digest>,
     /// Anything unusual.
     pub warnings: Vec<ScriptWarning>,

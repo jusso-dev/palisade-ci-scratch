@@ -92,6 +92,28 @@ fn os_fixture_names() -> Vec<String> {
         .collect()
 }
 
+/// The report invariants the `script_sig` fuzz target asserts, checked
+/// here too so that `cargo test` catches a change that breaks them.
+fn assert_report_invariants(report: &ScriptReport) {
+    assert!(report.signatures.signatures.len() <= 1);
+    let valid = report.signing_state == ScriptSigningState::Valid;
+    assert_eq!(valid, report.signatures.primary.is_some());
+    if valid {
+        assert!(report.text_issue.is_none());
+        assert!(report.block.is_some());
+    }
+    if let Some(issue) = report.text_issue {
+        assert!(!valid);
+        assert!(report.sip_digests.is_none());
+        if issue != TextIssue::NonAsciiUtf8 {
+            assert!(report.normalised_hash.is_none());
+        }
+    }
+    if let Some(block) = report.block {
+        assert!(block.offset.saturating_add(block.len) <= report.size);
+    }
+}
+
 /// Whether a fixture is UTF-8 text with characters outside ASCII in a
 /// script host format: no signature over it is valid.
 fn is_non_ascii_utf8_script_host(name: &str) -> bool {
@@ -226,6 +248,7 @@ fn every_fixture_verifies() {
     assert_eq!(os_names.len(), 18, "{os_names:?}");
     for name in names.iter().chain(&os_names) {
         let data = fixture(name);
+        assert_report_invariants(&verify(&data, kind_of(name)));
         if is_non_ascii_utf8_script_host(name) {
             continue;
         }
@@ -522,6 +545,7 @@ fn non_ascii_utf8_script_host_text_is_never_valid() {
     for name in &names {
         for data in [fixture(name), tamper(&fixture(name))] {
             let report = verify(&data, kind_of(name));
+            assert_report_invariants(&report);
             assert_eq!(
                 report.signing_state,
                 ScriptSigningState::Invalid(ScriptInvalidReason::Text(TextIssue::NonAsciiUtf8)),
@@ -2057,6 +2081,7 @@ proptest! {
     fn arbitrary_input_is_never_valid(data in proptest::collection::vec(any::<u8>(), 0..512)) {
         for kind in [ScriptKind::PowerShell, ScriptKind::VbScript, ScriptKind::WindowsScriptFile] {
             let report = verify(&data, kind);
+            assert_report_invariants(&report);
             prop_assert_ne!(&report.signing_state, &ScriptSigningState::Valid);
             prop_assert!(report.signatures.signatures.len() <= 1);
         }
@@ -2175,7 +2200,7 @@ fn write_script_fuzz_seeds() {
         ScriptKind::WindowsScriptFile => 5,
         _ => 6,
     };
-    for name in fixture_names() {
+    for name in fixture_names().into_iter().chain(os_fixture_names()) {
         let mut seed = vec![format_byte(kind_of(&name))];
         seed.extend_from_slice(&fixture(&name));
         std::fs::write(dir.join(format!("seed-{name}")), seed).unwrap();
