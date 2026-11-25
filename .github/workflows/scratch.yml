@@ -1,0 +1,21 @@
+# Scratch CI: Windows-only checks for jusso-dev/palisade work in progress.
+name: scratch
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: script tests
+        run: cargo test -p palisade-fileid --test script -- --nocapture
