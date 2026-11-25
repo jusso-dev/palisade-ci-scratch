@@ -163,6 +163,16 @@ impl<'a> Text<'a> {
         (0..self.len()).find(|i| self.starts_with_at(*i, s))
     }
 
+    /// Whether the ASCII text `s` occurs at or after unit `from`.
+    pub fn contains_from(&self, from: usize, s: &str) -> bool {
+        (from..self.len()).any(|i| self.starts_with_at(i, s))
+    }
+
+    /// Whether every code unit is ASCII.
+    pub fn is_ascii(&self) -> bool {
+        self.units_in(0, self.len()).all(|u| u < 0x80)
+    }
+
     /// Reads the signature block whose `begin` line starts at unit
     /// `begin`, exactly as signers write it: a CRLF before the begin line,
     /// the begin line, one `prefix base64 suffix` line per chunk of the

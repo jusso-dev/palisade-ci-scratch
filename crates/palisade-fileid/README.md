@@ -453,11 +453,14 @@ File identity: PE parsing, hashing (SHA-256, Authenticode, page and flat hashes)
     for `evaluate_trust` and `evaluate_validity`. A changed script is
     `DigestMismatch`.
   - Fails conservative: text without a byte order mark is read only when it
-    is ASCII (otherwise its digest depends on the machine's code page), and
-    invalid UTF-8 or UTF-16, two blocks, marker text anywhere else in the
-    file, a truncated, misplaced or non-CRLF block, non-strict base64,
-    trailing bytes and a signature for another format's package are all
-    invalid, never signed. Encoded scripts (`.vbe`, `.jse`) are unsigned with
+    is ASCII (otherwise its digest depends on the machine's code page);
+    VBScript, JScript and WSF text in UTF-8 is read only when it is ASCII
+    (the OS's own verifier rejects other UTF-8 text even when its own signer
+    signed it); and invalid UTF-8 or UTF-16, two blocks, marker text
+    anywhere else in the file, a truncated, misplaced or non-CRLF block, a
+    WSF block with no `</job>` after it, non-strict base64, trailing bytes
+    and a signature for another format's package are all invalid, never
+    signed. Encoded scripts (`.vbe`, `.jse`) are unsigned with
     an `UnsupportedEncoding` warning; files over 32 MiB (configurable) are
     `TooLargeForSignatureCheck`.
   - `SignedMetadata`: the signed metadata attributes (1.3.6.1.4.1.311.2.7.1

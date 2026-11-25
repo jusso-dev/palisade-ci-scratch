@@ -4,7 +4,13 @@
 # Every script here is written from scratch by this file and signed by
 # jsign, an independent open-source Authenticode signer whose script
 # digests agree with OS tooling, with throwaway keys made here, by a
-# test-only CA that nothing trusts. No private key is kept.
+# test-only CA that nothing trusts. No private key is kept. (The os-*
+# fixtures are made by generate-os.ps1, on Windows, with the OS's signer.)
+#
+# One exception: VBScript, JScript and WSF text in UTF-8 with characters
+# outside ASCII. The OS's verifier rejects jsign's signature on it, and
+# also the OS's own signer's, so its digest is not defined. jsign still
+# signs the utf8bom ones here; the tests require them to be undecodable.
 #
 # The matrix is every format the tests read, in every encoding its subject
 # interface package signs, with three line-ending conventions:
