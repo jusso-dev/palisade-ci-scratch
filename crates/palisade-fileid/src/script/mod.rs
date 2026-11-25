@@ -40,10 +40,17 @@
 //! For `.wsf`, the text after the block (the closing `</job>`) is hashed
 //! too. The text is decoded by its byte order mark: UTF-8, UTF-16LE or
 //! UTF-16BE (the PowerShell package does not sign UTF-16BE). Line endings
-//! are hashed as they are: an LF file and a CRLF file have different
-//! digests. These rules are checked against scripts signed by OS tooling
-//! in every format, encoding and line-ending combination, and against
-//! signed scripts the OS ships (`tests/script.rs`).
+//! (CRLF, LF or a lone CR) are hashed as they are: an LF file and a CRLF
+//! file have different digests. These rules are checked against scripts
+//! signed by OS tooling in every format, encoding and line-ending
+//! combination, against signed scripts the OS ships, and on Windows CI
+//! against the OS's own verdict on every fixture (`tests/script.rs`).
+//!
+//! One case has no defined digest: UTF-8 text with a character outside
+//! ASCII in a script host format. The OS's own signer signs it, and the
+//! OS's own verifier then reports a hash mismatch, so no rule both agree
+//! on exists. Such text is [`TextIssue::NonAsciiUtf8`], never valid. UTF-8
+//! text that is all ASCII, and UTF-16 text, are read as above.
 //!
 //! # Failing conservative
 //!
@@ -56,13 +63,15 @@
 //!   machine. It is read only when it is ASCII without NUL, which every
 //!   candidate decodes the same way; otherwise [`TextIssue`].
 //! - Invalid UTF-8 after a UTF-8 byte order mark, unpaired surrogates or an
-//!   odd length in UTF-16 text, a UTF-32 byte order mark, and UTF-16BE
-//!   PowerShell text are [`TextIssue`]s too.
+//!   odd length in UTF-16 text, a UTF-32 byte order mark, UTF-16BE
+//!   PowerShell text, and non-ASCII UTF-8 script host text are
+//!   [`TextIssue`]s too.
 //! - The block must be exactly as signers write it: one begin line and one
 //!   end line, each a whole line; a CRLF before the begin line; every line
 //!   ending in CRLF; every data line the format's comment prefix, strict
 //!   base64 and the comment suffix; and nothing after the end line except,
-//!   for `.wsf`, the rest of the file. Anything else is a [`BlockError`].
+//!   for `.wsf`, the rest of the file, which must hold a `</job>` (the
+//!   block sits inside a job). Anything else is a [`BlockError`].
 //!   The exact marker text anywhere else in the file, even inside a string,
 //!   is one too ([`BlockError::MultipleBlocks`]), because another reader
 //!   could take it for the block. Marker text that differs from the
@@ -205,6 +214,10 @@ pub(crate) struct Style {
     allows_text_after: bool,
     /// Whether the package signs UTF-16BE text.
     allows_utf16be: bool,
+    /// Whether UTF-8 text with characters outside ASCII has a digest the
+    /// OS agrees on. The script host packages' own signer and verifier
+    /// disagree on it, so for them it does not.
+    allows_non_ascii_utf8: bool,
     /// `SpcSipInfo.dwSIPversion`.
     sip_version: u32,
     /// `SpcSipInfo.gSIPguid`, as encoded.
@@ -231,6 +244,7 @@ const fn powershell(
         hashes_position: false,
         allows_text_after: false,
         allows_utf16be: false,
+        allows_non_ascii_utf8: true,
         sip_version: 0x0001_0000,
         sip_guid: POWERSHELL_SIP,
     }
@@ -252,6 +266,7 @@ const fn script_host(
         hashes_position: true,
         allows_text_after,
         allows_utf16be: true,
+        allows_non_ascii_utf8: false,
         sip_version: 1,
         sip_guid,
     }
@@ -344,6 +359,15 @@ pub enum TextIssue {
     Utf32Bom,
     /// UTF-16BE text, which the PowerShell package does not sign.
     Utf16BeNotSigned,
+    /// UTF-8 text (after its byte order mark) with a character outside
+    /// ASCII, in a format the script host packages sign (`.vbs`, `.js`,
+    /// `.wsf`). The OS's own verifier reports a hash mismatch for such
+    /// text even when the OS's own signer signed it, so its package digest
+    /// is not defined and no signature over it is valid. Unlike the other
+    /// issues the text decodes, so it still has a
+    /// [`ScriptReport::normalised_hash`]; [`ScriptReport::sip_digests`] is
+    /// `None`.
+    NonAsciiUtf8,
 }
 
 /// Why a signature block is not well formed.
@@ -384,6 +408,9 @@ pub enum BlockError {
     Base64,
     /// Bytes follow the SignedData in the decoded block.
     TrailingData,
+    /// In a Windows Script File, no `</job>` follows the block, so it is
+    /// not inside a job.
+    OutsideJob,
 }
 
 impl fmt::Display for BlockError {
@@ -401,6 +428,7 @@ impl fmt::Display for BlockError {
             Self::TooLarge => write!(f, "the signature exceeds {MAX_SIGNATURE_SIZE} bytes"),
             Self::Base64 => f.write_str("the signature block is not valid base64"),
             Self::TrailingData => f.write_str("bytes follow the signature in the block"),
+            Self::OutsideJob => f.write_str("no </job> follows the signature block"),
         }
     }
 }
@@ -492,7 +520,8 @@ pub struct ScriptReport {
     /// The text encoding. `None` when the file was not read.
     pub encoding: Option<TextEncoding>,
     /// Why the text cannot be decoded without ambiguity, if it cannot. The
-    /// digests are then `None`.
+    /// digests are then `None` (for [`TextIssue::NonAsciiUtf8`], only the
+    /// package digests).
     pub text_issue: Option<TextIssue>,
     /// The signing state.
     pub signing_state: ScriptSigningState,
@@ -506,9 +535,10 @@ pub struct ScriptReport {
     pub signatures: SignatureReport,
     /// The package's digests of the text without the block (SHA-256,
     /// SHA-1 and the signature's own algorithm): what the signature, or a
-    /// catalog, signs. `None` when the text was not read or does not
-    /// decode, and for an unsigned `.wsf`, whose block position the package
-    /// would choose.
+    /// catalog, signs. `None` when the text was not read, does not decode
+    /// or has no defined package digest ([`TextIssue::NonAsciiUtf8`]), and
+    /// for an unsigned `.wsf`, whose block position the package would
+    /// choose.
     pub sip_digests: Option<FlatHashes>,
     /// Whether the script's text outside the block is empty (an empty or
     /// BOM-only file, or one holding only a signature block). Its digests
@@ -603,6 +633,12 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         size,
         ..not_read(kind, options)
     };
+    // Encoded scripts are unsigned whatever their size, as in
+    // `verify_script_file`.
+    let Some(style) = kind.style() else {
+        report.warnings.push(ScriptWarning::UnsupportedEncoding);
+        return report;
+    };
     if size > options.max_size {
         report.signing_state = ScriptSigningState::TooLargeForSignatureCheck {
             size,
@@ -610,17 +646,20 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         };
         return report;
     }
-    let Some(style) = kind.style() else {
-        report.warnings.push(ScriptWarning::UnsupportedEncoding);
-        return report;
-    };
 
     let (text, mut issue) = text::Text::new(data);
     if issue.is_none() && text.encoding == TextEncoding::Utf16Be && !style.allows_utf16be {
         issue = Some(TextIssue::Utf16BeNotSigned);
     }
+    // Text that decodes, but whose package digest is not defined: it has
+    // a normalised hash, and no signature over it is valid.
+    let digest_issue = (issue.is_none()
+        && text.encoding == TextEncoding::Utf8Bom
+        && !style.allows_non_ascii_utf8
+        && !text.is_ascii())
+    .then_some(TextIssue::NonAsciiUtf8);
     report.encoding = Some(text.encoding);
-    report.text_issue = issue;
+    report.text_issue = issue.or(digest_issue);
 
     // Find the block. Markers are compared as exact ASCII text, which is
     // exact in every encoding read here.
@@ -649,6 +688,15 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
                 .find(style.begin)
                 .ok_or(BlockError::MissingEnd)
                 .and_then(|at| text.parse_block(at, style));
+            // A Windows Script File's block sits inside its job: a `</job>`
+            // must follow it.
+            let parsed = parsed.and_then(|block| {
+                if style.allows_text_after && !text.contains_from(block.end, "</job>") {
+                    Err(BlockError::OutsideJob)
+                } else {
+                    Ok(block)
+                }
+            });
             match parsed {
                 Ok(block) => Some(block),
                 Err(e) => {
@@ -666,7 +714,7 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         // Unsigned: the digests a catalog would list it under. A `.wsf`
         // has no defined block position until a signer places one.
         let digests = text.digests(None, style, AlgorithmSet::SHA256 | AlgorithmSet::SHA1);
-        if !style.allows_text_after {
+        if !style.allows_text_after && digest_issue.is_none() {
             report.sip_digests = digests.sip;
         }
         report.empty_text = digests.empty;
@@ -681,6 +729,24 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
             .byte_offset(block.end)
             .saturating_sub(text.byte_offset(block.start)),
     });
+    // The text's identity does not depend on the signature: compute it
+    // before the signature is decoded, so a broken signature leaves it.
+    let mut digests = text.digests(
+        Some(&block),
+        style,
+        AlgorithmSet::SHA256 | AlgorithmSet::SHA1,
+    );
+    report.empty_text = digests.empty;
+    if !digests.empty {
+        report.normalised_hash = digests.normalised.clone();
+    }
+    if digest_issue.is_none() {
+        report.sip_digests = digests.sip.clone();
+    }
+    if let Some(issue) = digest_issue {
+        unreadable(&mut report, ScriptInvalidReason::Text(issue));
+        return report;
+    }
 
     let der = match text::decode_base64(&block.payload) {
         Some(der) if der.len() <= MAX_SIGNATURE_SIZE => der,
@@ -719,20 +785,18 @@ pub fn verify_script(data: &[u8], kind: ScriptKind, options: &ScriptOptions) -> 
         }
     };
 
-    let mut algorithms = AlgorithmSet::SHA256 | AlgorithmSet::SHA1;
+    // The signature's own algorithm, if it is not one already computed.
     if let Some(alg) = signed
         .indirect
         .digest_alg
         .as_ref()
         .ok()
         .and_then(|a| a.hash_algorithm())
+        .filter(|a| digests.sip.as_ref().is_some_and(|d| d.get(*a).is_none()))
     {
+        let mut algorithms = AlgorithmSet::SHA256 | AlgorithmSet::SHA1;
         algorithms.insert(alg);
-    }
-    let digests = text.digests(Some(&block), style, algorithms);
-    report.empty_text = digests.empty;
-    if !digests.empty {
-        report.normalised_hash = digests.normalised;
+        digests = text.digests(Some(&block), style, algorithms);
     }
     let script_digests = AuthenticodeHashes {
         digests: digests
@@ -815,6 +879,17 @@ pub fn verify_script_file(
     kind: ScriptKind,
     options: &ScriptOptions,
 ) -> std::io::Result<ScriptReport> {
+    verify_script_file_with(path, kind, options, || {})
+}
+
+/// [`verify_script_file`], calling `after_path_check` between the path
+/// check and the open (for tests of a path replaced in between).
+fn verify_script_file_with(
+    path: &Path,
+    kind: ScriptKind,
+    options: &ScriptOptions,
+    after_path_check: impl FnOnce(),
+) -> std::io::Result<ScriptReport> {
     // As `crate::hash::hash_file`: pipes and devices have no stable
     // content. The path is checked first; it can be replaced after that,
     // so the open must not block on a FIFO, and the opened handle decides.
@@ -822,6 +897,7 @@ pub fn verify_script_file(
     if !std::fs::metadata(path)?.is_file() {
         return Err(not_a_file());
     }
+    after_path_check();
     let file = crate::hash::open_without_blocking(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -979,5 +1055,47 @@ pub fn evaluate_script_trust(
         trust: first.unwrap_or_else(|| evaluate_trust(&report.signatures, &empty, None)),
         signed_metadata: None,
         publisher_product: None,
+    }
+}
+
+// FIFOs are a Unix concern: opening a named pipe on Windows does not wait.
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A regular file that passes the path check and is then replaced by a
+    /// FIFO before the open: the open must not wait for a writer, and the
+    /// handle check must refuse it.
+    #[test]
+    fn a_fifo_swapped_in_after_the_path_check_is_refused_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("palisade-script-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("swap.ps1");
+        std::fs::write(&path, b"Write-Output 1\r\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = path.clone();
+        std::thread::spawn(move || {
+            let swap = || {
+                std::fs::remove_file(&worker).unwrap();
+                let made = std::process::Command::new("mkfifo")
+                    .arg(&worker)
+                    .status()
+                    .unwrap();
+                assert!(made.success());
+            };
+            let _ = tx.send(verify_script_file_with(
+                &worker,
+                ScriptKind::PowerShell,
+                &ScriptOptions::default(),
+                swap,
+            ));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("verify_script_file blocked on a FIFO swapped in after the path check");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!std::fs::metadata(&path).unwrap().is_file(), "the swap ran");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

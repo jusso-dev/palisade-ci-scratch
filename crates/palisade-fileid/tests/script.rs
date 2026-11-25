@@ -4,9 +4,14 @@
 //!
 //! - `fixtures/script`: scripts written and signed by `generate.sh` there,
 //!   with jsign (an independent signer whose script digests agree with OS
-//!   tooling) and a throwaway test CA, in every format, encoding and
-//!   line-ending combination. Each must verify, and fail with a digest
-//!   mismatch when one character changes.
+//!   tooling, except on non-ASCII UTF-8 script host text) and a throwaway
+//!   test CA, in every format, encoding and line-ending combination. Each
+//!   must verify, and fail with a digest mismatch when one character
+//!   changes; the non-ASCII UTF-8 script host ones, which the OS rejects,
+//!   must be undecodable instead.
+//! - `fixtures/script/os-*`: script host files in UTF-8 with a byte order
+//!   mark, signed by the OS's own signer (`generate-os.ps1`). The OS
+//!   accepts the ASCII ones and rejects the others, and so must this crate.
 //! - Scripts signed here, by [`Signer`]: a P-256 key generated per run,
 //!   a certificate and SignedData built byte by byte. These cover the
 //!   cases no signer makes on request: signed metadata attributes, broken
@@ -30,8 +35,8 @@ mod common;
 use std::path::Path;
 
 use palisade_fileid::authenticode::{
-    DigestAlgorithm, SignatureError, SignatureKind, SignatureStatus, SignatureWarning,
-    SignedMetadata, SigningState, TrustConfig, UntrustedReason,
+    BadSignature, DigestAlgorithm, SignatureError, SignatureKind, SignatureStatus,
+    SignatureWarning, SignedMetadata, SigningState, TrustConfig, UntrustedReason,
 };
 use palisade_fileid::script::{
     BlockError, DEFAULT_MAX_SCRIPT_SIZE, ScriptAnchorPolicy, ScriptAnchorSource,
@@ -58,16 +63,47 @@ fn verify(data: &[u8], kind: ScriptKind) -> ScriptReport {
     verify_script(data, kind, &ScriptOptions::default())
 }
 
-/// Every signed fixture `generate.sh` writes.
-fn fixture_names() -> Vec<String> {
+/// Every script fixture file name (not the OS-signing generator, which is
+/// itself a PowerShell script).
+fn script_files() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(FIXTURES)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| ScriptKind::from_path(Path::new(n)).is_some())
-        .filter(|n| !n.contains("nonascii"))
+        .filter(|n| n != "generate-os.ps1")
         .collect();
     names.sort();
     names
+}
+
+/// Every signed fixture `generate.sh` writes.
+fn fixture_names() -> Vec<String> {
+    script_files()
+        .into_iter()
+        .filter(|n| !n.contains("nonascii") && !n.starts_with("os-"))
+        .collect()
+}
+
+/// The fixtures `generate-os.ps1` writes with the OS's own signer.
+fn os_fixture_names() -> Vec<String> {
+    script_files()
+        .into_iter()
+        .filter(|n| n.starts_with("os-"))
+        .collect()
+}
+
+/// Whether a fixture is UTF-8 text with characters outside ASCII in a
+/// script host format: no signature over it is valid.
+fn is_non_ascii_utf8_script_host(name: &str) -> bool {
+    let script_host = ["js-", "vbs-", "wsf-", "os-js-", "os-vbs-", "os-wsf-"]
+        .iter()
+        .any(|p| name.starts_with(p));
+    let non_ascii_utf8 = if name.starts_with("os-") {
+        name.contains("-unicode-")
+    } else {
+        name.contains("-utf8bom-")
+    };
+    script_host && non_ascii_utf8
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +221,14 @@ fn every_fixture_verifies() {
     // 5 formats x 3 encodings x 3 line endings, 3 formats in UTF-16BE x 3,
     // and the two other PowerShell extensions.
     assert_eq!(names.len(), 45 + 9 + 2, "{names:?}");
-    for name in &names {
+    let os_names = os_fixture_names();
+    // 3 formats x ASCII or not x 3 line endings.
+    assert_eq!(os_names.len(), 18, "{os_names:?}");
+    for name in names.iter().chain(&os_names) {
         let data = fixture(name);
+        if is_non_ascii_utf8_script_host(name) {
+            continue;
+        }
         let report = verify(&data, kind_of(name));
         assert_eq!(
             report.signing_state,
@@ -211,6 +253,70 @@ fn every_fixture_verifies() {
             .and_then(|d| d.get(palisade_fileid::hash::HashAlgorithm::Sha256))
             .unwrap();
         assert_eq!(sha256.as_bytes(), expected, "{name}");
+    }
+}
+
+/// The encoding and line ending of a fixture's script text, read from its
+/// bytes: the byte order mark, and the line breaks before the signature
+/// block (whose own lines always end in CRLF).
+fn encoding_and_eol(data: &[u8]) -> (&'static str, &'static str) {
+    let (units, _) = utf16_of(data);
+    let encoding = match data {
+        [0xff, 0xfe, ..] => "utf16le",
+        [0xfe, 0xff, ..] => "utf16be",
+        [0xef, 0xbb, 0xbf, ..] => "utf8bom",
+        _ => "utf8",
+    };
+    let text = String::from_utf16(&units).unwrap();
+    let begin = [
+        "\r\n# SIG #",
+        "\r\n<!-- SIG #",
+        "\r\n'' SIG ''",
+        "\r\n// SIG //",
+        "\r\n<signature>",
+    ]
+    .iter()
+    .find_map(|m| text.find(m))
+    .unwrap();
+    let body = &text[..begin];
+    let crlf = body.matches("\r\n").count();
+    let cr = body.matches('\r').count() - crlf;
+    let lf = body.matches('\n').count() - crlf;
+    let eol = match (crlf > 0, lf > 0, cr > 0) {
+        (true, false, false) => "crlf",
+        (false, true, false) => "lf",
+        (false, false, true) => "cr",
+        other => panic!("mixed line endings {other:?}"),
+    };
+    (encoding, eol)
+}
+
+/// Each fixture is what its name says: the byte order mark, the line
+/// endings of its script text, and (with a byte order mark) text outside
+/// ASCII, or for the OS-signed ones the ASCII or not its name says. So a
+/// fixture replaced by another's content fails here even if the count and
+/// every digest still agree.
+#[test]
+fn fixtures_match_their_names() {
+    for name in fixture_names() {
+        let data = fixture(&name);
+        let stem = name.rsplit_once('.').unwrap().0;
+        let parts: Vec<&str> = stem.split('-').collect();
+        let (encoding, eol) = encoding_and_eol(&data);
+        assert_eq!((encoding, eol), (parts[1], parts[2]), "{name}");
+        let (units, _) = utf16_of(&data);
+        let ascii = units.iter().all(|u| *u < 0x80);
+        assert_eq!(ascii, encoding == "utf8", "{name}");
+    }
+    for name in os_fixture_names() {
+        let data = fixture(&name);
+        let stem = name.rsplit_once('.').unwrap().0;
+        let parts: Vec<&str> = stem.split('-').collect();
+        let (encoding, eol) = encoding_and_eol(&data);
+        assert_eq!((encoding, eol), (parts[2], parts[4]), "{name}");
+        let (units, _) = utf16_of(&data);
+        let ascii = units.iter().all(|u| *u < 0x80);
+        assert_eq!(ascii, parts[3] == "ascii", "{name}");
     }
 }
 
@@ -242,7 +348,10 @@ fn tamper(data: &[u8]) -> Vec<u8> {
 
 #[test]
 fn changing_one_character_is_a_digest_mismatch() {
-    for name in fixture_names() {
+    for name in fixture_names().into_iter().chain(os_fixture_names()) {
+        if is_non_ascii_utf8_script_host(&name) {
+            continue;
+        }
         let data = tamper(&fixture(&name));
         let report = verify(&data, kind_of(&name));
         assert_eq!(
@@ -396,6 +505,55 @@ fn non_ascii_without_a_byte_order_mark_is_never_valid() {
     }
 }
 
+/// UTF-8 script host text outside ASCII has no digest the OS agrees on:
+/// the OS's own verifier rejects it even when the OS's own signer signed it
+/// (`os-*-unicode-*`), and it rejects jsign's too. So it is never valid,
+/// tampered or not, and has no package digest, but keeps its normalised
+/// hash. UTF-8 that is all ASCII is valid (`os-*-ascii-*`), and so is
+/// non-ASCII UTF-8 PowerShell text, whose package the OS agrees with.
+#[test]
+fn non_ascii_utf8_script_host_text_is_never_valid() {
+    let names: Vec<String> = fixture_names()
+        .into_iter()
+        .chain(os_fixture_names())
+        .filter(|n| is_non_ascii_utf8_script_host(n))
+        .collect();
+    assert_eq!(names.len(), 9 + 9, "{names:?}");
+    for name in &names {
+        for data in [fixture(name), tamper(&fixture(name))] {
+            let report = verify(&data, kind_of(name));
+            assert_eq!(
+                report.signing_state,
+                ScriptSigningState::Invalid(ScriptInvalidReason::Text(TextIssue::NonAsciiUtf8)),
+                "{name}"
+            );
+            assert_eq!(report.text_issue, Some(TextIssue::NonAsciiUtf8));
+            assert_eq!(
+                report.signatures.signing_state,
+                SigningState::Invalid(
+                    palisade_fileid::authenticode::InvalidReason::ScriptSignatureBlock
+                )
+            );
+            assert!(report.signatures.signatures.is_empty());
+            assert!(report.sip_digests.is_none());
+            assert!(report.normalised_hash.is_some());
+            assert!(report.block.is_some());
+        }
+    }
+    // The same text unsigned: unsigned, with no package digest to look up.
+    let data = fixture("vbs-utf8bom-crlf.vbs");
+    let report = verify(&data[..block_start(&data)], ScriptKind::VbScript);
+    assert_eq!(report.signing_state, ScriptSigningState::Unsigned);
+    assert_eq!(report.text_issue, Some(TextIssue::NonAsciiUtf8));
+    assert!(report.sip_digests.is_none());
+    assert!(report.catalog_digests().flat_sha256.is_none());
+    assert!(report.normalised_hash.is_some());
+    // PowerShell's package hashes the same encoding as the OS does.
+    let report = verify(&fixture("ps1-utf8bom-cr.ps1"), ScriptKind::PowerShell);
+    assert_eq!(report.signing_state, ScriptSigningState::Valid);
+    assert!(report.text_issue.is_none());
+}
+
 #[test]
 fn wsf_signature_moved_out_of_place_fails() {
     // Moving the block earlier changes the position the digest covers.
@@ -409,6 +567,35 @@ fn wsf_signature_moved_out_of_place_fails() {
     let moved = format!("{}{}{}", &rest[..first_line], block, &rest[first_line..]);
     let report = verify(moved.as_bytes(), ScriptKind::WindowsScriptFile);
     assert_eq!(report.signing_state, ScriptSigningState::DigestMismatch);
+}
+
+#[test]
+fn wsf_signature_after_the_last_job_fails() {
+    // The block moved after the closing `</job>`: not inside a job.
+    let data = fixture("wsf-utf8-crlf.wsf");
+    let text = std::str::from_utf8(&data).unwrap();
+    let start = text.find("\r\n<signature>").unwrap();
+    let stop = text.find("</signature>\r\n").unwrap() + "</signature>\r\n".len();
+    assert_eq!(&text[stop..], "</job>\r\n");
+    let moved = format!("{}</job>{}", &text[..start], &text[start..stop]);
+    let report = verify(moved.as_bytes(), ScriptKind::WindowsScriptFile);
+    assert_eq!(
+        report.signing_state,
+        ScriptSigningState::Invalid(ScriptInvalidReason::Block(BlockError::OutsideJob)),
+        "{report:#?}"
+    );
+    assert!(report.signatures.signatures.is_empty());
+    // With nothing at all after the block, likewise.
+    let report = verify(&data[..stop], ScriptKind::WindowsScriptFile);
+    assert_eq!(
+        report.signing_state,
+        ScriptSigningState::Invalid(ScriptInvalidReason::Block(BlockError::OutsideJob))
+    );
+    // In place it verifies.
+    assert_eq!(
+        verify(&data, ScriptKind::WindowsScriptFile).signing_state,
+        ScriptSigningState::Valid
+    );
 }
 
 #[test]
@@ -1073,18 +1260,72 @@ fn nested_signatures_are_ignored_with_a_warning() {
 #[test]
 fn a_forged_signature_is_not_valid() {
     let signer = Signer::new();
-    let mut data = sign_ps1(&signer, BODY, &[]);
-    // Flip a bit in the middle of the signature's base64: the block still
-    // parses, but the SignedData no longer verifies or no longer decodes.
-    let text = String::from_utf8(data.clone()).unwrap();
-    let line = text.find("\r\n# M").unwrap() + 4 + 40;
-    data[line] = if data[line] == b'A' { b'B' } else { b'A' };
-    let report = verify(&data, ScriptKind::PowerShell);
-    assert!(
-        matches!(report.signing_state, ScriptSigningState::Invalid(_)),
+    let mut probe = b"\xef\xbb\xbf".to_vec();
+    probe.extend_from_slice(BODY.as_bytes());
+    let body = probe.clone();
+    probe.extend_from_slice(ps_block(&[0]).as_bytes());
+    let digest = sip_digest(&probe, "ps1");
+    let der = signer.signed_data(&digest, POWERSHELL_SIP, 0x0001_0000, &[], None);
+    let script = |der: &[u8]| [body.as_slice(), ps_block(der).as_bytes()].concat();
+    // The control verifies.
+    assert_eq!(
+        verify(&script(&der), ScriptKind::PowerShell).signing_state,
+        ScriptSigningState::Valid
+    );
+    // Change the last byte of the signer's signature value, the ECDSA `s`
+    // integer: still well-formed DER over the same digest, but the
+    // signature no longer verifies.
+    let marker = [alg(ECDSA_SHA256), vec![0x04]].concat();
+    let at = der
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .unwrap()
+        + marker.len()
+        - 1;
+    let last = at + 1 + usize::from(der[at + 1]);
+    let mut forged = der.clone();
+    forged[last] ^= 0x01;
+    let report = verify(&script(&forged), ScriptKind::PowerShell);
+    let bad = SignatureStatus::BadSignature(BadSignature::SignatureInvalid);
+    assert_eq!(
+        report.signing_state,
+        ScriptSigningState::Invalid(ScriptInvalidReason::Signature(bad.clone())),
         "{report:#?}"
     );
+    assert_eq!(report.signature().unwrap().status, bad);
+    assert_eq!(
+        report.signature().unwrap().signed_image_digest.as_deref(),
+        Some(&digest[..])
+    );
     assert_eq!(report.signatures.primary, None);
+}
+
+#[test]
+fn a_broken_signature_keeps_the_text_identity() {
+    // The block's boundaries and the text are unchanged, but its DER is
+    // not a SignedData: the text still has its identity.
+    let signer = Signer::new();
+    let data = sign_ps1(&signer, BODY, &[]);
+    let good = verify(&data, ScriptKind::PowerShell);
+    let mut broken = data.clone();
+    // The first base64 character encodes the outer SEQUENCE tag.
+    let at = find(&data, b"\r\n# M") + 4;
+    broken[at] = b'N';
+    let report = verify(&broken, ScriptKind::PowerShell);
+    assert!(
+        matches!(
+            report.signing_state,
+            ScriptSigningState::Invalid(ScriptInvalidReason::Signature(
+                SignatureStatus::Malformed(_)
+            ))
+        ),
+        "{report:#?}"
+    );
+    assert_eq!(report.block, good.block);
+    assert!(good.normalised_hash.is_some());
+    assert_eq!(report.normalised_hash, good.normalised_hash);
+    assert_eq!(report.sip_digests, good.sip_digests);
+    assert_eq!(report.catalog_digests(), good.catalog_digests());
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,6 +1600,15 @@ fn encoded_scripts_are_unsigned_with_a_warning() {
         ScriptKind::from_extension("VBE"),
         Some(ScriptKind::EncodedVbScript)
     );
+    // Over the size limit too, as from a file.
+    let tiny = ScriptOptions {
+        max_size: 1,
+        ..ScriptOptions::default()
+    };
+    let report = verify_script(b"ab", ScriptKind::EncodedVbScript, &tiny);
+    assert_eq!(report.signing_state, ScriptSigningState::Unsigned);
+    assert_eq!(report.warnings, vec![ScriptWarning::UnsupportedEncoding]);
+    assert_eq!(report.size, 2);
 }
 
 #[test]
@@ -1489,6 +1739,11 @@ fn empty_text_has_no_identity() {
     let der = signer.signed_data(&digest, POWERSHELL_SIP, 0x0001_0000, &[], None);
     let only_block = ps_block(&der);
     let report = verify(only_block.as_bytes(), ScriptKind::PowerShell);
+    assert_eq!(
+        report.signing_state,
+        ScriptSigningState::Valid,
+        "{report:#?}"
+    );
     assert!(report.empty_text);
     assert!(report.normalised_hash.is_none());
     assert_eq!(
@@ -1685,18 +1940,22 @@ fn signature_digest_algorithm_is_recorded() {
 // ---------------------------------------------------------------------------
 // The OS, as a differential check (Windows only).
 
-/// On Windows, the OS's own verdict on every fixture and on a copy with
-/// one character changed: whenever this crate says a script is validly
-/// signed the OS must not report a hash mismatch or no signature, and
-/// whenever this crate says the digest does not match, the OS must say so
-/// too. Trust is not compared: the fixtures' root is in no store.
+/// On Windows, the OS's own verdict on every fixture (the OS-signed ones
+/// too) and on a copy with one character changed: whenever this crate says
+/// a script is validly signed the OS must say the signature itself is sound
+/// (valid, or valid but its root not trusted), whenever this crate says
+/// the digest does not match the OS must say so too, and the non-ASCII
+/// UTF-8 script host text this crate calls undecodable the OS must reject
+/// with a hash mismatch. No other status counts as agreement. Trust is not
+/// compared: the fixtures' roots are in no store. Every disagreement is
+/// collected and reported, not only the first.
 #[cfg(windows)]
 #[test]
 fn os_trust_verification_agrees() {
     let dir = std::env::temp_dir().join(format!("palisade-script-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut cases = Vec::new();
-    for name in fixture_names() {
+    for name in fixture_names().into_iter().chain(os_fixture_names()) {
         let data = fixture(&name);
         let original = dir.join(&name);
         std::fs::write(&original, &data).unwrap();
@@ -1712,10 +1971,13 @@ fn os_trust_verification_agrees() {
     let paths: Vec<String> = cases.iter().map(|(p, _)| p.display().to_string()).collect();
     std::fs::write(&list, paths.join("\r\n")).unwrap();
     // `Stop` turns any per-file error into a failing exit with a message,
-    // instead of a silently missing status line.
+    // instead of a silently missing status line. Each line is the status
+    // and the OS's own result code for it, from the signature's status
+    // message.
     let script = "$ErrorActionPreference = 'Stop'; \
                   Get-Content -Encoding UTF8 -LiteralPath $env:PALISADE_SCRIPT_LIST | \
-                  ForEach-Object { (Get-AuthenticodeSignature -LiteralPath $_).Status.ToString() }";
+                  ForEach-Object { $s = Get-AuthenticodeSignature -LiteralPath $_; \
+                  $s.Status.ToString() + '|' + ($s.StatusMessage -replace '\\s+', ' ') }";
     // A test run started from PowerShell 7 (the CI default shell) passes its
     // module path on, and Windows PowerShell then fails to load its own
     // built-in security module, which provides `Get-AuthenticodeSignature`.
@@ -1729,30 +1991,59 @@ fn os_trust_verification_agrees() {
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{stderr}");
-    let statuses: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let statuses: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(str::to_owned)
+        .map(|l| {
+            let (status, message) = l.split_once('|').unwrap_or((l, ""));
+            (status.to_owned(), message.trim().to_owned())
+        })
         .collect();
     assert_eq!(
         statuses.len(),
         cases.len(),
         "statuses {statuses:?}; stderr {stderr}"
     );
-    for ((path, ours), os) in cases.iter().zip(&statuses) {
-        match ours {
-            ScriptSigningState::Valid => assert!(
-                os != "HashMismatch" && os != "NotSigned" && os != "Incompatible",
-                "{}: valid here, {os} for the OS",
-                path.display()
-            ),
-            ScriptSigningState::DigestMismatch => {
-                assert_eq!(os, "HashMismatch", "{}", path.display());
+    let mut disagreements = Vec::new();
+    for ((path, ours), (os, message)) in cases.iter().zip(&statuses) {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let agrees = match ours {
+            // A sound signature whose root is in no store: the OS reports
+            // it valid, or unknown with the untrusted-root message.
+            ScriptSigningState::Valid => {
+                os == "Valid" || (os == "UnknownError" && untrusted_root(message))
             }
-            other => panic!("{}: unexpected {other:?}", path.display()),
+            ScriptSigningState::DigestMismatch
+            | ScriptSigningState::Invalid(ScriptInvalidReason::Text(TextIssue::NonAsciiUtf8)) => {
+                os == "HashMismatch"
+            }
+            _ => false,
+        };
+        eprintln!("{name}: ours {ours:?}, OS {os} ({message})");
+        if !agrees {
+            disagreements.push(format!("{name}: ours {ours:?}, OS {os} ({message})"));
         }
     }
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} disagree:\n{}",
+        disagreements.len(),
+        cases.len(),
+        disagreements.join("\n")
+    );
+}
+
+/// Whether an OS status message is the one for a chain that ends in a root
+/// no store trusts, and nothing else.
+#[cfg(windows)]
+fn untrusted_root(message: &str) -> bool {
+    [
+        "terminated in a root certificate which is not trusted",
+        "could not be built to a trusted root authority",
+    ]
+    .iter()
+    .any(|m| message.contains(m))
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,8 +2067,7 @@ proptest! {
     /// break), leaves it anything but validly signed.
     #[test]
     fn one_byte_changes_are_never_valid(index in 0_usize..4096, byte in any::<u8>()) {
-        let data = fixture("ps1-utf8bom-crlf.ps1");
-        let outside: Vec<usize> = (0..data.len()).filter(|i| !is_base64_data(&data, *i)).collect();
+        let (data, _, outside) = &*PS_FIXTURE_BYTES;
         let at = outside[index % outside.len()];
         prop_assume!(data[at] != byte);
         let mut changed = data.clone();
@@ -1796,8 +2086,7 @@ proptest! {
         index in 0_usize..4096,
         byte in any::<u8>(),
     ) {
-        let data = fixture("ps1-utf8bom-crlf.ps1");
-        let inside: Vec<usize> = (0..data.len()).filter(|i| is_base64_data(&data, *i)).collect();
+        let (data, inside, _) = &*PS_FIXTURE_BYTES;
         let at = inside[index % inside.len()];
         prop_assume!(data[at] != byte);
         let mut changed = data.clone();
@@ -1808,7 +2097,7 @@ proptest! {
         let anchors = ScriptTrustAnchors { policy: &config, os_root_store: None };
         let trust = evaluate_script_trust(&report, &anchors, ScriptAnchorPolicy::PolicyAnchors);
         if trust.anchor.is_some() {
-            let original = verify(&data, ScriptKind::PowerShell);
+            let original = verify(data, ScriptKind::PowerShell);
             let before = original.signature().unwrap();
             let after = report.signature().unwrap();
             prop_assert_eq!(&before.signed_image_digest, &after.signed_image_digest);
@@ -1830,24 +2119,35 @@ proptest! {
     }
 }
 
-/// Whether byte `at` of a PowerShell fixture is a base64 character of a
-/// block data line.
-fn is_base64_data(data: &[u8], at: usize) -> bool {
-    let start = block_start(data);
-    if at < start {
-        return false;
-    }
-    let line_start = data[..at]
-        .iter()
-        .rposition(|b| *b == b'\n')
-        .map_or(0, |p| p + 1);
-    let line = &data[line_start..];
-    let line = &line[..line.iter().position(|b| *b == b'\r').unwrap_or(line.len())];
-    line.starts_with(b"# ")
-        && !line.starts_with(b"# SIG #")
-        && at >= line_start + 2
-        && at < line_start + line.len()
-}
+/// `ps1-utf8bom-crlf.ps1`, the offsets of its block's base64 characters,
+/// and every other offset; classified once for the properties.
+static PS_FIXTURE_BYTES: std::sync::LazyLock<(Vec<u8>, Vec<usize>, Vec<usize>)> =
+    std::sync::LazyLock::new(|| {
+        let data = fixture("ps1-utf8bom-crlf.ps1");
+        let start = block_start(&data);
+        let mut inside = Vec::new();
+        let mut outside: Vec<usize> = (0..start).collect();
+        let mut line_start = start;
+        for (i, b) in data.iter().enumerate().skip(start) {
+            if *b == b'\n' {
+                line_start = i + 1;
+                outside.push(i);
+                continue;
+            }
+            let line = &data[line_start..];
+            let line = &line[..line.iter().position(|b| *b == b'\r').unwrap_or(line.len())];
+            let base64 = line.starts_with(b"# ")
+                && !line.starts_with(b"# SIG #")
+                && i >= line_start + 2
+                && i < line_start + line.len();
+            if base64 {
+                inside.push(i);
+            } else {
+                outside.push(i);
+            }
+        }
+        (data, inside, outside)
+    });
 
 // ---------------------------------------------------------------------------
 // Fuzz seeds.
